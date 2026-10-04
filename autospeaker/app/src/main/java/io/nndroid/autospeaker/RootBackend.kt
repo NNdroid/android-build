@@ -13,6 +13,7 @@ object RootBackend {
         private set
 
     fun setSpeaker(context: Context, enabled: Boolean, callback: (Boolean, String) -> Unit) {
+        AppLog.i(context, "Root", "starting su/app_process speaker enabled=$enabled")
         Thread {
             val result = runCatching {
                 val apk = shellQuote(context.applicationInfo.sourceDir)
@@ -35,7 +36,13 @@ object RootBackend {
                 false to "${it.javaClass.simpleName}: ${it.message}"
             }
 
-            if (!result.first) lastError = result.second
+            if (!result.first) {
+                lastError = result.second
+                AppLog.w(context, "Root", "route failed: ${result.second}")
+            } else {
+                lastError = ""
+                AppLog.i(context, "Root", "speaker route succeeded")
+            }
             mainHandler.post { callback(result.first, result.second) }
         }.start()
     }
