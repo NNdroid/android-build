@@ -83,8 +83,12 @@ class MainActivity : AppCompatActivity() {
                         ShizukuBridge.warmUp(this@MainActivity)
                         Toast.makeText(this@MainActivity, "Shizuku 已授权，正在连接 UserService", Toast.LENGTH_SHORT).show()
                     }
-                    ShizukuBridge.lastError == "Shizuku is not running" -> {
-                        Toast.makeText(this@MainActivity, "Shizuku 未运行，请先启动 Shizuku", Toast.LENGTH_LONG).show()
+                    ShizukuBridge.lastError.startsWith("Shizuku Binder not received") -> {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "未收到 Shizuku Binder。请确认 Shizuku 首页显示服务正在运行，然后返回重试。",
+                            Toast.LENGTH_LONG
+                        ).show()
                         packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")?.let { launch ->
                             runCatching { startActivity(launch) }
                         }
@@ -155,7 +159,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshStatus() {
         if (::statusView.isInitialized) {
+            val provider = packageManager.resolveContentProvider("$packageName.shizuku", 0)
             statusView.text = buildString {
+                append("Shizuku Provider：${if (provider != null) "已注册" else "缺失"}\n")
                 append("Shizuku：${ShizukuBridge.status()}\n")
                 if (ShizukuBridge.lastError.isNotBlank()) append("Shizuku 信息：${ShizukuBridge.lastError}\n")
                 append("当前后端：${CallState.lastBackend.ifBlank { "尚未执行" }}")
