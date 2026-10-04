@@ -13,4 +13,4 @@ When an incoming call is manually answered, it tries speaker routing in this ord
 3. Root `su` + `app_process`
 4. Accessibility fallback that clicks the visible speakerphone control
 
-GitHub Actions builds `AutoSpeaker-debug` for pull requests and `main`.
+Shizuku and root are optional. GitHub Actions builds and uploads the `AutoSpeaker-debug` APK artifact.
