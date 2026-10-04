@@ -12,6 +12,7 @@ class SpeakerAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        AppLog.i(this, "Accessibility", "service connected")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -21,7 +22,10 @@ class SpeakerAccessibilityService : AccessibilityService() {
 
     private fun tryClickSpeaker() {
         if (!CallState.activeIncomingCall || !CallState.accessibilityFallbackRequested) return
-        val root = rootInActiveWindow ?: return
+        val root = rootInActiveWindow ?: run {
+            AppLog.w(this, "Accessibility", "root window unavailable")
+            return
+        }
 
         for (label in labels) {
             val nodes = root.findAccessibilityNodeInfosByText(label)
@@ -33,6 +37,7 @@ class SpeakerAccessibilityService : AccessibilityService() {
                 CallState.accessibilityFallbackRequested = false
                 CallState.lastBackend = "无障碍（已开启）"
                 CallState.lastError = ""
+                AppLog.i(this, "Accessibility", "speaker already enabled via label=$label")
                 return
             }
 
@@ -41,9 +46,11 @@ class SpeakerAccessibilityService : AccessibilityService() {
                 CallState.accessibilityFallbackRequested = false
                 CallState.lastBackend = "无障碍"
                 CallState.lastError = ""
+                AppLog.i(this, "Accessibility", "clicked speaker control label=$label")
                 return
             }
         }
+        AppLog.w(this, "Accessibility", "speaker control not found in active window")
     }
 
     private fun clickableParent(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
@@ -56,9 +63,12 @@ class SpeakerAccessibilityService : AccessibilityService() {
         return null
     }
 
-    override fun onInterrupt() = Unit
+    override fun onInterrupt() {
+        AppLog.w(this, "Accessibility", "service interrupted")
+    }
 
     override fun onDestroy() {
+        AppLog.w(this, "Accessibility", "service destroyed")
         if (instance === this) instance = null
         super.onDestroy()
     }
