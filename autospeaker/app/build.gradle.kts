@@ -6,6 +6,7 @@ plugins {
 android {
     namespace = "io.nndroid.autospeaker"
     compileSdk = 35
+
     defaultConfig {
         applicationId = "io.nndroid.autospeaker"
         minSdk = 26
@@ -13,6 +14,15 @@ android {
         versionCode = 1
         versionName = "0.1.0"
     }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 dependencies {
