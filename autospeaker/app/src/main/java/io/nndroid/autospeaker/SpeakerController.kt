@@ -27,8 +27,11 @@ object SpeakerController {
             if (!CallState.activeIncomingCall) return@postDelayed
             if (isSpeakerActuallyActive(context, audio, "AudioManager")) {
                 markSuccess(context, "AudioManager")
+            } else if (SpeakerAccessibilityService.isConnected()) {
+                AppLog.w(context, "AudioManager", "actual route is not speaker; accessibility is connected, trying UI fallback before privileged backends")
+                tryAccessibilityFirst(context.applicationContext)
             } else {
-                AppLog.w(context, "AudioManager", "actual communication route is not speaker; falling back to Shizuku")
+                AppLog.w(context, "AudioManager", "actual route is not speaker and accessibility is unavailable; falling back to Shizuku")
                 tryShizuku(context.applicationContext)
             }
         }, 450)
@@ -61,6 +64,29 @@ object SpeakerController {
             CallState.lastError = "AudioManager: ${it.message}"
             AppLog.e(context, "AudioManager", "legacy setSpeakerphoneOn failed", it)
         }
+    }
+
+    private fun tryAccessibilityFirst(context: Context) {
+        if (!CallState.activeIncomingCall) return
+        CallState.lastBackend = "无障碍"
+        CallState.accessibilityFallbackRequested = true
+        AppLog.i(context, "Router", "trying accessibility before Shizuku on vivo route-reset path")
+        SpeakerAccessibilityService.requestSpeakerClick()
+
+        mainHandler.postDelayed({
+            if (!CallState.activeIncomingCall) return@postDelayed
+            if (!CallState.accessibilityFallbackRequested && isSpeakerActuallyActive(context, source = "Accessibility-preferred")) {
+                markSuccess(context, "无障碍")
+                return@postDelayed
+            }
+            if (isSpeakerActuallyActive(context, source = "Accessibility-preferred-timeout")) {
+                CallState.accessibilityFallbackRequested = false
+                markSuccess(context, "无障碍")
+                return@postDelayed
+            }
+            AppLog.w(context, "Router", "accessibility preferred attempt did not establish speaker route; continuing to Shizuku")
+            tryShizuku(context)
+        }, 2200)
     }
 
     private fun tryShizuku(context: Context) {
