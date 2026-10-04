@@ -12,6 +12,7 @@ import android.telephony.TelephonyManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import rikka.shizuku.Shizuku
@@ -31,6 +32,9 @@ class MainActivity : AppCompatActivity() {
             if (::statusView.isInitialized) {
                 statusView.text = buildString {
                     append("Shizuku：${ShizukuBridge.status()}\n")
+                    if (ShizukuBridge.lastError.isNotBlank()) {
+                        append("Shizuku 信息：${ShizukuBridge.lastError}\n")
+                    }
                     append("当前后端：${CallState.lastBackend}")
                     if (CallState.lastError.isNotBlank()) append("\n最后错误：${CallState.lastError}")
                 }
@@ -39,7 +43,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { _, _ ->
+    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { _, grantResult ->
+        val message = if (grantResult == PackageManager.PERMISSION_GRANTED) {
+            "Shizuku 授权成功"
+        } else {
+            "Shizuku 授权被拒绝"
+        }
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
         handler.post(statusRefresh)
     }
 
@@ -66,7 +76,24 @@ class MainActivity : AppCompatActivity() {
 
         layout.addView(Button(this).apply {
             text = "授权 / 检查 Shizuku"
-            setOnClickListener { ShizukuBridge.requestPermission(); handler.postDelayed(statusRefresh, 300) }
+            setOnClickListener {
+                val granted = ShizukuBridge.requestPermission()
+                handler.postDelayed(statusRefresh, 300)
+
+                when {
+                    granted -> Toast.makeText(this@MainActivity, "Shizuku 已授权", Toast.LENGTH_SHORT).show()
+                    ShizukuBridge.lastError == "Shizuku is not running" -> {
+                        Toast.makeText(this@MainActivity, "Shizuku 未运行，请先启动 Shizuku", Toast.LENGTH_LONG).show()
+                        packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")?.let { launch ->
+                            runCatching { startActivity(launch) }
+                        }
+                    }
+                    ShizukuBridge.lastError.isNotBlank() -> {
+                        Toast.makeText(this@MainActivity, "Shizuku：${ShizukuBridge.lastError}", Toast.LENGTH_LONG).show()
+                    }
+                    else -> Toast.makeText(this@MainActivity, "已请求 Shizuku 授权，请确认授权弹窗", Toast.LENGTH_LONG).show()
+                }
+            }
         })
 
         layout.addView(Button(this).apply {
