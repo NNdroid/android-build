@@ -2,28 +2,37 @@ name: Build AutoSpeaker APK
 
 on:
   push:
-    branches: [ main, feat/vivo-x60-auto-speaker ]
+    branches: [ main ]
     paths: [ 'autospeaker/**', '.github/workflows/autospeaker.yml' ]
   pull_request:
     paths: [ 'autospeaker/**', '.github/workflows/autospeaker.yml' ]
   workflow_dispatch:
 
+concurrency:
+  group: autospeaker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '8.9'
       - name: Build debug APK
         working-directory: autospeaker
-        run: gradle --no-daemon :app:assembleDebug
-      - uses: actions/upload-artifact@v4
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+      - uses: actions/upload-artifact@v7
         with:
           name: AutoSpeaker-debug
           path: autospeaker/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
