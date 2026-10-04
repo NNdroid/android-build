@@ -21,24 +21,24 @@ object SpeakerController {
         AppLog.i(context, "Router", "starting backend chain")
 
         val audio = context.getSystemService(AudioManager::class.java)
-        requestPublicSpeakerRoute(context, audio)
+        requestPublicSpeakerRoute(context, audio, "initial")
 
         mainHandler.postDelayed({
             if (!CallState.activeIncomingCall) return@postDelayed
-            if (isSpeakerActuallyActive(context, audio, "AudioManager")) {
+            if (isSpeakerActuallyActive(context, audio, "AudioManager-initial")) {
                 markSuccess(context, "AudioManager")
             } else if (SpeakerAccessibilityService.isConnected()) {
-                AppLog.w(context, "AudioManager", "actual route is not speaker; accessibility is connected, trying UI fallback before privileged backends")
+                AppLog.w(context, "AudioManager", "initial route was reset; accessibility is connected, trying UI route first")
                 tryAccessibilityFirst(context.applicationContext)
             } else {
-                AppLog.w(context, "AudioManager", "actual route is not speaker and accessibility is unavailable; falling back to Shizuku")
-                tryShizuku(context.applicationContext)
+                AppLog.w(context, "AudioManager", "initial route was reset and accessibility is unavailable; scheduling +1s stabilization retry")
+                tryStabilizedPublicRetry(context.applicationContext)
             }
         }, 450)
     }
 
-    private fun requestPublicSpeakerRoute(context: Context, audio: AudioManager) {
-        AppLog.i(context, "AudioManager", "request speaker route")
+    private fun requestPublicSpeakerRoute(context: Context, audio: AudioManager, attempt: String) {
+        AppLog.i(context, "AudioManager", "request speaker route attempt=$attempt")
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val speaker = runCatching {
@@ -49,11 +49,11 @@ object SpeakerController {
 
             if (speaker != null) {
                 val accepted = runCatching { audio.setCommunicationDevice(speaker) }
-                    .onFailure { AppLog.e(context, "AudioManager", "setCommunicationDevice failed", it) }
+                    .onFailure { AppLog.e(context, "AudioManager", "setCommunicationDevice failed attempt=$attempt", it) }
                     .getOrDefault(false)
-                AppLog.i(context, "AudioManager", "setCommunicationDevice speaker accepted=$accepted device=${describeDevice(speaker)}")
+                AppLog.i(context, "AudioManager", "setCommunicationDevice speaker accepted=$accepted attempt=$attempt device=${describeDevice(speaker)}")
             } else {
-                AppLog.w(context, "AudioManager", "built-in speaker missing from availableCommunicationDevices")
+                AppLog.w(context, "AudioManager", "built-in speaker missing from availableCommunicationDevices attempt=$attempt")
             }
         }
 
@@ -62,7 +62,7 @@ object SpeakerController {
             audio.isSpeakerphoneOn = true
         }.onFailure {
             CallState.lastError = "AudioManager: ${it.message}"
-            AppLog.e(context, "AudioManager", "legacy setSpeakerphoneOn failed", it)
+            AppLog.e(context, "AudioManager", "legacy setSpeakerphoneOn failed attempt=$attempt", it)
         }
     }
 
@@ -70,23 +70,51 @@ object SpeakerController {
         if (!CallState.activeIncomingCall) return
         CallState.lastBackend = "无障碍"
         CallState.accessibilityFallbackRequested = true
-        AppLog.i(context, "Router", "trying accessibility before Shizuku on vivo route-reset path")
+        AppLog.i(context, "Router", "trying accessibility before privileged backends")
         SpeakerAccessibilityService.requestSpeakerClick()
 
         mainHandler.postDelayed({
             if (!CallState.activeIncomingCall) return@postDelayed
-            if (!CallState.accessibilityFallbackRequested && isSpeakerActuallyActive(context, source = "Accessibility-preferred")) {
-                markSuccess(context, "无障碍")
-                return@postDelayed
-            }
-            if (isSpeakerActuallyActive(context, source = "Accessibility-preferred-timeout")) {
+            if (isSpeakerActuallyActive(context, source = "Accessibility-preferred")) {
                 CallState.accessibilityFallbackRequested = false
                 markSuccess(context, "无障碍")
                 return@postDelayed
             }
-            AppLog.w(context, "Router", "accessibility preferred attempt did not establish speaker route; continuing to Shizuku")
-            tryShizuku(context)
-        }, 2200)
+            AppLog.w(context, "Router", "accessibility attempt did not establish speaker route; scheduling +1s stabilization retry")
+            tryStabilizedPublicRetry(context)
+        }, 1800)
+    }
+
+    private fun tryStabilizedPublicRetry(context: Context) {
+        mainHandler.postDelayed({
+            if (!CallState.activeIncomingCall) return@postDelayed
+            val audio = context.getSystemService(AudioManager::class.java)
+
+            if (isSpeakerActuallyActive(context, audio, "pre-stabilization-retry")) {
+                markSuccess(context, "已有扬声器路由")
+                return@postDelayed
+            }
+
+            val current = currentCommunicationDevice(audio)
+            if (isExternalUserRoute(current)) {
+                CallState.lastBackend = "保持外部音频设备"
+                CallState.lastError = "检测到外部通话音频设备，停止自动切换"
+                AppLog.i(context, "Router", "stabilization retry cancelled because current route is external device=${describeDevice(current)}")
+                return@postDelayed
+            }
+
+            AppLog.i(context, "Router", "running delayed stabilization retry +1s")
+            requestPublicSpeakerRoute(context, audio, "stabilization+1s")
+            mainHandler.postDelayed({
+                if (!CallState.activeIncomingCall) return@postDelayed
+                if (isSpeakerActuallyActive(context, audio, "AudioManager-stabilization+1s")) {
+                    markSuccess(context, "AudioManager(+1s)")
+                } else {
+                    AppLog.w(context, "Router", "+1s retry was also reset to non-speaker; continuing to Shizuku")
+                    tryShizuku(context)
+                }
+            }, 450)
+        }, 1000)
     }
 
     private fun tryShizuku(context: Context) {
@@ -144,11 +172,13 @@ object SpeakerController {
         }, 450)
     }
 
-    fun isSpeakerActuallyActive(context: Context, audio: AudioManager = context.getSystemService(AudioManager::class.java), source: String = "verify"): Boolean {
+    fun isSpeakerActuallyActive(
+        context: Context,
+        audio: AudioManager = context.getSystemService(AudioManager::class.java),
+        source: String = "verify"
+    ): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val device = runCatching { audio.communicationDevice }
-                .onFailure { AppLog.e(context, "RouteVerify", "getCommunicationDevice failed source=$source", it) }
-                .getOrNull()
+            val device = currentCommunicationDevice(audio)
             val speaker = device?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
             AppLog.i(context, "RouteVerify", "source=$source communicationDevice=${describeDevice(device)} speaker=$speaker")
             return speaker
@@ -158,6 +188,27 @@ object SpeakerController {
         val legacy = runCatching { audio.isSpeakerphoneOn }.getOrDefault(false)
         AppLog.i(context, "RouteVerify", "source=$source legacySpeakerphone=$legacy")
         return legacy
+    }
+
+    private fun currentCommunicationDevice(audio: AudioManager): AudioDeviceInfo? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
+        return runCatching { audio.communicationDevice }.getOrNull()
+    }
+
+    private fun isExternalUserRoute(device: AudioDeviceInfo?): Boolean {
+        if (device == null) return false
+        return when (device.type) {
+            AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+            AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            AudioDeviceInfo.TYPE_USB_DEVICE,
+            AudioDeviceInfo.TYPE_USB_HEADSET,
+            AudioDeviceInfo.TYPE_HEARING_AID,
+            AudioDeviceInfo.TYPE_BLE_HEADSET,
+            AudioDeviceInfo.TYPE_BLE_SPEAKER -> true
+            else -> false
+        }
     }
 
     private fun markSuccess(context: Context, backend: String) {
