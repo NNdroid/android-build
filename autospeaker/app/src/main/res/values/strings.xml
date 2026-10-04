@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AutoSpeaker</string>
+    <string name="accessibility_desc">接通来电后自动点击通话界面的免提按钮</string>
+</resources>
