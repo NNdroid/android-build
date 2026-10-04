@@ -27,14 +27,17 @@ object ShizukuBridge {
         ComponentName(context.packageName, ShizukuAudioService::class.java.name)
     ).processNameSuffix("autospeaker")
         .daemon(true)
-        .tag("autospeaker_audio_v3")
-        .version(3)
+        .tag("autospeaker_audio_v4")
+        .version(4)
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
         val context = appContext ?: return@OnBinderReceivedListener
+        lastError = ""
         AppLog.i(context, "Shizuku", "binder received uid=${runCatching { Shizuku.getUid() }.getOrDefault(-1)}")
         if (runCatching { Shizuku.checkSelfPermission() }.getOrDefault(PackageManager.PERMISSION_DENIED) == PackageManager.PERMISSION_GRANTED) {
             warmUp(context)
+        } else {
+            AppLog.i(context, "Shizuku", "binder alive but permission not granted")
         }
     }
 
@@ -42,15 +45,15 @@ object ShizukuBridge {
         val context = appContext
         service = null
         binding = false
-        lastError = "Shizuku binder died"
-        if (context != null) AppLog.w(context, "Shizuku", "binder died; UserService will be rebound when Shizuku returns")
+        lastError = "Shizuku Binder disconnected"
+        if (context != null) AppLog.w(context, "Shizuku", "binder died; waiting for Shizuku server to return")
     }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             binding = false
             service = IPrivilegedAudioService.Stub.asInterface(binder)
-            appContext?.let { AppLog.i(it, "Shizuku", "UserService connected") }
+            appContext?.let { AppLog.i(it, "Shizuku", "UserService connected component=$name") }
             val enabled = pendingEnabled
             val callback = pendingCallback
             pendingEnabled = null
@@ -62,7 +65,7 @@ object ShizukuBridge {
             service = null
             binding = false
             lastError = "Shizuku UserService disconnected"
-            appContext?.let { AppLog.w(it, "Shizuku", "UserService disconnected") }
+            appContext?.let { AppLog.w(it, "Shizuku", "UserService disconnected component=$name") }
         }
     }
 
@@ -72,7 +75,13 @@ object ShizukuBridge {
         initialized = true
         Shizuku.addBinderReceivedListenerSticky(binderReceivedListener)
         Shizuku.addBinderDeadListener(binderDeadListener)
-        AppLog.i(context, "Shizuku", "bridge initialized")
+
+        val provider = context.packageManager.resolveContentProvider("${context.packageName}.shizuku", 0)
+        AppLog.i(
+            context,
+            "Shizuku",
+            "bridge initialized provider=${provider?.name ?: "MISSING"} authority=${provider?.authority ?: "-"} binder=${runCatching { Shizuku.pingBinder() }.getOrDefault(false)}"
+        )
     }
 
     fun requestPermission(context: Context? = appContext): Boolean {
@@ -80,12 +89,15 @@ object ShizukuBridge {
         lastError = ""
         return runCatching {
             if (!Shizuku.pingBinder()) {
-                lastError = "Shizuku is not running"
-                context?.let { AppLog.w(it, "Shizuku", lastError) }
+                lastError = "Shizuku Binder not received (server stopped or binder delivery failed)"
+                context?.let {
+                    val provider = it.packageManager.resolveContentProvider("${it.packageName}.shizuku", 0)
+                    AppLog.w(it, "Shizuku", "$lastError; provider=${provider?.name ?: "MISSING"}")
+                }
                 false
             } else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
                 context?.let {
-                    AppLog.i(it, "Shizuku", "permission already granted")
+                    AppLog.i(it, "Shizuku", "permission already granted uid=${runCatching { Shizuku.getUid() }.getOrDefault(-1)}")
                     warmUp(it)
                 }
                 true
@@ -106,21 +118,27 @@ object ShizukuBridge {
     }
 
     fun status(): String = when {
-        !runCatching { Shizuku.pingBinder() }.getOrDefault(false) -> "未运行"
-        runCatching { Shizuku.checkSelfPermission() }.getOrDefault(PackageManager.PERMISSION_DENIED) != PackageManager.PERMISSION_GRANTED -> "未授权"
+        !runCatching { Shizuku.pingBinder() }.getOrDefault(false) -> "未连接（未收到 Binder）"
+        runCatching { Shizuku.checkSelfPermission() }.getOrDefault(PackageManager.PERMISSION_DENIED) != PackageManager.PERMISSION_GRANTED -> "已连接，未授权"
         service != null -> "已连接"
-        binding -> "连接中"
+        binding -> "已授权，UserService 连接中"
         else -> "已授权"
     }
 
     fun warmUp(context: Context) {
         init(context)
-        if (!runCatching { Shizuku.pingBinder() }.getOrDefault(false)) return
-        if (runCatching { Shizuku.checkSelfPermission() }.getOrDefault(PackageManager.PERMISSION_DENIED) != PackageManager.PERMISSION_GRANTED) return
+        if (!runCatching { Shizuku.pingBinder() }.getOrDefault(false)) {
+            AppLog.w(context, "Shizuku", "warmUp skipped: binder unavailable")
+            return
+        }
+        if (runCatching { Shizuku.checkSelfPermission() }.getOrDefault(PackageManager.PERMISSION_DENIED) != PackageManager.PERMISSION_GRANTED) {
+            AppLog.i(context, "Shizuku", "warmUp skipped: permission not granted")
+            return
+        }
         if (service != null || binding) return
 
         binding = true
-        AppLog.i(context, "Shizuku", "binding daemon UserService")
+        AppLog.i(context, "Shizuku", "binding daemon UserService uid=${runCatching { Shizuku.getUid() }.getOrDefault(-1)}")
         mainHandler.post {
             runCatching { Shizuku.bindUserService(args(context.applicationContext), connection) }
                 .onFailure {
@@ -144,7 +162,7 @@ object ShizukuBridge {
             lastError = if (runCatching { Shizuku.pingBinder() }.getOrDefault(false)) {
                 "Shizuku permission not granted"
             } else {
-                "Shizuku not running"
+                "Shizuku Binder unavailable"
             }
             AppLog.w(context, "Shizuku", lastError)
             callback(false, lastError)
