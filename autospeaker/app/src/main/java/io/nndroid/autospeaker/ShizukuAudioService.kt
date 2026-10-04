@@ -4,11 +4,9 @@ import android.content.Context
 import androidx.annotation.Keep
 
 @Keep
-class ShizukuAudioService : IPrivilegedAudioService.Stub() {
-    constructor()
-
+class ShizukuAudioService() : IPrivilegedAudioService.Stub() {
     @Keep
-    constructor(@Suppress("UNUSED_PARAMETER") context: Context)
+    constructor(@Suppress("UNUSED_PARAMETER") context: Context) : this()
 
     override fun setSpeakerphone(enabled: Boolean): Boolean =
         PrivilegedAudioRouter.setSpeakerphone(enabled)
