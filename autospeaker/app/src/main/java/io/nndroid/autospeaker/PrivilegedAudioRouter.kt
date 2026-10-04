@@ -42,8 +42,9 @@ object PrivilegedAudioRouter {
                     else -> false
                 }
                 if (invoked) {
-                    Thread.sleep(120)
-                    if (isSpeakerphoneOn()) return true
+                    Thread.sleep(180)
+                    if (isSpeakerphoneOn() == enabled) return true
+                    errors += "IAudioService method ${method.parameterCount} args invoked but state did not change"
                 }
             }
             false
@@ -52,7 +53,7 @@ object PrivilegedAudioRouter {
 
         if (serviceResult) return true
 
-        val forceUseResult = runCatching {
+        val forceUseRequested = runCatching {
             val cls = Class.forName("android.media.AudioSystem")
             val method = cls.getDeclaredMethod(
                 "setForceUse",
@@ -62,13 +63,21 @@ object PrivilegedAudioRouter {
             method.isAccessible = true
             // FOR_COMMUNICATION = 0; FORCE_SPEAKER = 1; FORCE_NONE = 0
             val rc = method.invoke(null, 0, if (enabled) 1 else 0) as? Int ?: -1
-            Thread.sleep(120)
-            rc == 0 || isSpeakerphoneOn() == enabled
+            Thread.sleep(180)
+            if (rc != 0) errors += "AudioSystem.setForceUse rc=$rc"
+            rc == 0
         }.onFailure { errors += "AudioSystem: ${it.javaClass.simpleName}: ${it.message}" }
             .getOrDefault(false)
 
-        if (!forceUseResult) lastError = errors.joinToString(" | ").ifBlank { "No compatible privileged audio route API" }
-        return forceUseResult
+        // setForceUse returning OK only means the request reached AudioPolicy. Telecom/OEM policy may
+        // immediately override it. The caller performs the authoritative communication-device check.
+        if (forceUseRequested) {
+            lastError = "AudioSystem request accepted; real route must be verified by caller"
+            return true
+        }
+
+        lastError = errors.joinToString(" | ").ifBlank { "No compatible privileged audio route API" }
+        return false
     }
 
     fun isSpeakerphoneOn(): Boolean = runCatching {
