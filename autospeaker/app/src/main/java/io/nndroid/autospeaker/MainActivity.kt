@@ -62,7 +62,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(layout)
 
         layout.addView(TextView(this).apply {
-            text = "AutoSpeaker · vivo X60\n\n来电手动接听后自动尝试：\n1. AudioManager / setCommunicationDevice\n2. Shizuku daemon UserService\n3. Root + app_process\n4. 无障碍点击免提\n\n你的 vivo 会把底层音频路由重新拉回听筒，因此无障碍回退必须真正开启。只有实际通信设备确认切到内置扬声器才算成功。"
+            text = "AutoSpeaker · vivo X60\n\n来电手动接听后自动尝试：\n1. AudioManager / setCommunicationDevice\n2. 无障碍点击系统电话界面的免提\n3. +1 秒稳定化重试\n4. Shizuku / Root 兜底\n\n如果系统电话只显示图标，可使用“学习免提按钮”：你手动点一次真正的扬声器图标，应用会在确认实际路由变成扬声器后保存该控件指纹。"
             textSize = 17f
         })
 
@@ -111,6 +111,33 @@ class MainActivity : AppCompatActivity() {
                         AppLog.e(this@MainActivity, "UI", "failed to open accessibility settings", it)
                         Toast.makeText(this@MainActivity, "无法打开无障碍设置：${it.message}", Toast.LENGTH_LONG).show()
                     }
+            }
+        })
+
+        layout.addView(Button(this).apply {
+            text = "学习免提按钮（图标无文字时）"
+            setOnClickListener {
+                if (!SpeakerAccessibilityService.isConnected()) {
+                    Toast.makeText(this@MainActivity, "请先开启 AutoSpeaker 无障碍服务", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+                SpeakerAccessibilityService.startLearning(this@MainActivity)
+                AppLog.i(this@MainActivity, "UI", "speaker button learning requested")
+                Toast.makeText(
+                    this@MainActivity,
+                    "学习模式已开启 30 秒。切回正在通话的 vivo 电话界面，手动点一次真正的扬声器图标；只有检测到实际切到扬声器才会保存。",
+                    Toast.LENGTH_LONG
+                ).show()
+                refreshStatus()
+            }
+        })
+
+        layout.addView(Button(this).apply {
+            text = "清除已学习免提按钮"
+            setOnClickListener {
+                SpeakerAccessibilityService.clearLearnedFingerprint(this@MainActivity)
+                Toast.makeText(this@MainActivity, "已清除免提按钮学习记录", Toast.LENGTH_SHORT).show()
+                refreshStatus()
             }
         })
 
@@ -177,11 +204,14 @@ class MainActivity : AppCompatActivity() {
             val provider = packageManager.resolveContentProvider("$packageName.shizuku", 0)
             val accessibilityConfigured = SpeakerAccessibilityService.isEnabledInSettings(this)
             val accessibilityConnected = SpeakerAccessibilityService.isConnected()
+            val learning = SpeakerAccessibilityService.isLearning(this)
+            val learned = SpeakerAccessibilityService.hasLearnedFingerprint(this)
             statusView.text = buildString {
                 append("Shizuku Provider：${if (provider != null) "已注册" else "缺失"}\n")
                 append("Shizuku：${ShizukuBridge.status()}\n")
                 append("无障碍设置：${if (accessibilityConfigured) "已开启" else "未开启（必须开启）"}\n")
                 append("无障碍服务：${if (accessibilityConnected) "已连接" else "未连接"}\n")
+                append("免提按钮学习：${when { learning -> "学习中（请手动点一次扬声器图标）"; learned -> "已学习"; else -> "未学习" }}\n")
                 if (accessibilityConfigured && !accessibilityConnected) {
                     append("无障碍提示：开关已开但服务未绑定，请关闭后重新开启一次\n")
                 }
