@@ -27,14 +27,21 @@ object SpeakerController {
             if (!CallState.activeIncomingCall) return@postDelayed
             if (isSpeakerActuallyActive(context, audio, "AudioManager-initial")) {
                 markSuccess(context, "AudioManager")
-            } else if (SpeakerAccessibilityService.isConnected()) {
-                AppLog.w(context, "AudioManager", "initial route was reset; accessibility is connected, trying UI route first")
-                tryAccessibilityFirst(context.applicationContext)
-            } else {
-                AppLog.w(context, "AudioManager", "initial route was reset and accessibility is unavailable; scheduling +1s stabilization retry")
-                tryStabilizedPublicRetry(context.applicationContext)
+                return@postDelayed
             }
-        }, 450)
+
+            AppLog.w(context, "AudioManager", "initial route was reset by telecom/oem policy")
+            if (SpeakerAccessibilityService.isConnected()) {
+                tryAccessibilityImmediately(context.applicationContext)
+            } else {
+                AppLog.i(context, "Router", "accessibility unavailable; waiting 1s before stabilization retry")
+            }
+
+            // Important on vivo/OriginOS: the first route request can be overwritten while
+            // Telecom is still settling the call audio state. Re-check exactly one second
+            // later. If accessibility already established speaker, this becomes a no-op.
+            scheduleStabilizationRetry(context.applicationContext, 1000L)
+        }, 450L)
     }
 
     private fun requestPublicSpeakerRoute(context: Context, audio: AudioManager, attempt: String) {
@@ -51,7 +58,11 @@ object SpeakerController {
                 val accepted = runCatching { audio.setCommunicationDevice(speaker) }
                     .onFailure { AppLog.e(context, "AudioManager", "setCommunicationDevice failed attempt=$attempt", it) }
                     .getOrDefault(false)
-                AppLog.i(context, "AudioManager", "setCommunicationDevice speaker accepted=$accepted attempt=$attempt device=${describeDevice(speaker)}")
+                AppLog.i(
+                    context,
+                    "AudioManager",
+                    "setCommunicationDevice speaker accepted=$accepted attempt=$attempt device=${describeDevice(speaker)}"
+                )
             } else {
                 AppLog.w(context, "AudioManager", "built-in speaker missing from availableCommunicationDevices attempt=$attempt")
             }
@@ -66,55 +77,60 @@ object SpeakerController {
         }
     }
 
-    private fun tryAccessibilityFirst(context: Context) {
+    private fun tryAccessibilityImmediately(context: Context) {
         if (!CallState.activeIncomingCall) return
         CallState.lastBackend = "无障碍"
         CallState.accessibilityFallbackRequested = true
-        AppLog.i(context, "Router", "trying accessibility before privileged backends")
+        AppLog.i(context, "Router", "accessibility connected; trying UI speaker control immediately while stabilization timer runs")
         SpeakerAccessibilityService.requestSpeakerClick()
-
-        mainHandler.postDelayed({
-            if (!CallState.activeIncomingCall) return@postDelayed
-            if (isSpeakerActuallyActive(context, source = "Accessibility-preferred")) {
-                CallState.accessibilityFallbackRequested = false
-                markSuccess(context, "无障碍")
-                return@postDelayed
-            }
-            AppLog.w(context, "Router", "accessibility attempt did not establish speaker route; scheduling +1s stabilization retry")
-            tryStabilizedPublicRetry(context)
-        }, 1800)
     }
 
-    private fun tryStabilizedPublicRetry(context: Context) {
+    private fun scheduleStabilizationRetry(context: Context, delayMs: Long) {
         mainHandler.postDelayed({
             if (!CallState.activeIncomingCall) return@postDelayed
             val audio = context.getSystemService(AudioManager::class.java)
 
             if (isSpeakerActuallyActive(context, audio, "pre-stabilization-retry")) {
-                markSuccess(context, "已有扬声器路由")
+                CallState.accessibilityFallbackRequested = false
+                markSuccess(context, "扬声器已稳定")
+                AppLog.i(context, "Router", "+1s retry skipped because speaker is already active")
                 return@postDelayed
             }
 
             val current = currentCommunicationDevice(audio)
             if (isExternalUserRoute(current)) {
+                CallState.accessibilityFallbackRequested = false
                 CallState.lastBackend = "保持外部音频设备"
                 CallState.lastError = "检测到外部通话音频设备，停止自动切换"
-                AppLog.i(context, "Router", "stabilization retry cancelled because current route is external device=${describeDevice(current)}")
+                AppLog.i(
+                    context,
+                    "Router",
+                    "stabilization retry cancelled because current route is external device=${describeDevice(current)}"
+                )
                 return@postDelayed
             }
 
-            AppLog.i(context, "Router", "running delayed stabilization retry +1s")
-            requestPublicSpeakerRoute(context, audio, "stabilization+1s")
+            AppLog.i(context, "Router", "running delayed stabilization retry delayMs=$delayMs")
+            requestPublicSpeakerRoute(context, audio, "stabilization+${delayMs}ms")
+
             mainHandler.postDelayed({
                 if (!CallState.activeIncomingCall) return@postDelayed
-                if (isSpeakerActuallyActive(context, audio, "AudioManager-stabilization+1s")) {
-                    markSuccess(context, "AudioManager(+1s)")
+                if (isSpeakerActuallyActive(context, audio, "AudioManager-stabilization+${delayMs}ms")) {
+                    CallState.accessibilityFallbackRequested = false
+                    markSuccess(context, "AudioManager(+${delayMs}ms)")
                 } else {
-                    AppLog.w(context, "Router", "+1s retry was also reset to non-speaker; continuing to Shizuku")
+                    // Stop pending accessibility retries before entering the privileged chain,
+                    // otherwise a late UI retry could toggle an already-changed route.
+                    CallState.accessibilityFallbackRequested = false
+                    AppLog.w(
+                        context,
+                        "Router",
+                        "+${delayMs}ms retry was also reset to non-speaker; continuing to Shizuku"
+                    )
                     tryShizuku(context)
                 }
-            }, 450)
-        }, 1000)
+            }, 450L)
+        }, delayMs)
     }
 
     private fun tryShizuku(context: Context) {
@@ -169,7 +185,7 @@ object SpeakerController {
                 AppLog.w(context, "Router", "$error; continuing fallback chain")
                 onFailure()
             }
-        }, 450)
+        }, 450L)
     }
 
     fun isSpeakerActuallyActive(
@@ -180,7 +196,11 @@ object SpeakerController {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val device = currentCommunicationDevice(audio)
             val speaker = device?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-            AppLog.i(context, "RouteVerify", "source=$source communicationDevice=${describeDevice(device)} speaker=$speaker")
+            AppLog.i(
+                context,
+                "RouteVerify",
+                "source=$source communicationDevice=${describeDevice(device)} speaker=$speaker"
+            )
             return speaker
         }
 
