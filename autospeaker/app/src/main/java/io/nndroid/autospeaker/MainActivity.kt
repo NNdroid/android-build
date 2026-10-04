@@ -62,7 +62,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(layout)
 
         layout.addView(TextView(this).apply {
-            text = "AutoSpeaker · vivo X60\n\n来电手动接听后自动尝试：\n1. AudioManager / setCommunicationDevice\n2. Shizuku daemon UserService\n3. Root + app_process\n4. 无障碍点击免提\n\n只有实际通信设备确认切到内置扬声器才算成功；隐藏 API 返回成功但实际路由未改变时会继续回退。"
+            text = "AutoSpeaker · vivo X60\n\n来电手动接听后自动尝试：\n1. AudioManager / setCommunicationDevice\n2. Shizuku daemon UserService\n3. Root + app_process\n4. 无障碍点击免提\n\n你的 vivo 会把底层音频路由重新拉回听筒，因此无障碍回退必须真正开启。只有实际通信设备确认切到内置扬声器才算成功。"
             textSize = 17f
         })
 
@@ -102,10 +102,15 @@ class MainActivity : AppCompatActivity() {
         })
 
         layout.addView(Button(this).apply {
-            text = "开启无障碍服务"
+            text = "开启 AutoSpeaker 无障碍（必须）"
             setOnClickListener {
-                AppLog.i(this@MainActivity, "UI", "opening accessibility settings")
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                AppLog.i(this@MainActivity, "UI", "opening accessibility settings configured=${SpeakerAccessibilityService.isEnabledInSettings(this@MainActivity)} connected=${SpeakerAccessibilityService.isConnected()}")
+                Toast.makeText(this@MainActivity, "请在无障碍列表中找到 AutoSpeaker 并打开开关，然后返回本应用确认显示“已连接”", Toast.LENGTH_LONG).show()
+                runCatching { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                    .onFailure {
+                        AppLog.e(this@MainActivity, "UI", "failed to open accessibility settings", it)
+                        Toast.makeText(this@MainActivity, "无法打开无障碍设置：${it.message}", Toast.LENGTH_LONG).show()
+                    }
             }
         })
 
@@ -157,13 +162,29 @@ class MainActivity : AppCompatActivity() {
         handler.post(statusRefresh)
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (::statusView.isInitialized) {
+            val configured = SpeakerAccessibilityService.isEnabledInSettings(this)
+            val connected = SpeakerAccessibilityService.isConnected()
+            AppLog.i(this, "Accessibility", "resume configured=$configured connected=$connected")
+            refreshStatus()
+        }
+    }
+
     private fun refreshStatus() {
         if (::statusView.isInitialized) {
             val provider = packageManager.resolveContentProvider("$packageName.shizuku", 0)
+            val accessibilityConfigured = SpeakerAccessibilityService.isEnabledInSettings(this)
+            val accessibilityConnected = SpeakerAccessibilityService.isConnected()
             statusView.text = buildString {
                 append("Shizuku Provider：${if (provider != null) "已注册" else "缺失"}\n")
                 append("Shizuku：${ShizukuBridge.status()}\n")
-                append("无障碍：${if (SpeakerAccessibilityService.isConnected()) "已连接" else "未连接"}\n")
+                append("无障碍设置：${if (accessibilityConfigured) "已开启" else "未开启（必须开启）"}\n")
+                append("无障碍服务：${if (accessibilityConnected) "已连接" else "未连接"}\n")
+                if (accessibilityConfigured && !accessibilityConnected) {
+                    append("无障碍提示：开关已开但服务未绑定，请关闭后重新开启一次\n")
+                }
                 if (ShizukuBridge.lastError.isNotBlank()) append("Shizuku 信息：${ShizukuBridge.lastError}\n")
                 append("当前后端：${CallState.lastBackend.ifBlank { "尚未执行" }}")
                 if (CallState.lastError.isNotBlank()) append("\n最后错误：${CallState.lastError}")
