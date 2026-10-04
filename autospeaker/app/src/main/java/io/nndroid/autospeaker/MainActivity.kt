@@ -62,7 +62,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(layout)
 
         layout.addView(TextView(this).apply {
-            text = "AutoSpeaker · vivo X60\n\n来电手动接听后自动尝试：\n1. AudioManager\n2. Shizuku daemon UserService\n3. Root + app_process\n4. 无障碍点击免提\n\nShizuku 后端采用 daemon 模式；App 进程被回收后特权 UserService 仍可保留。"
+            text = "AutoSpeaker · vivo X60\n\n来电手动接听后自动尝试：\n1. AudioManager / setCommunicationDevice\n2. Shizuku daemon UserService\n3. Root + app_process\n4. 无障碍点击免提\n\n只有实际通信设备确认切到内置扬声器才算成功；隐藏 API 返回成功但实际路由未改变时会继续回退。"
             textSize = 17f
         })
 
@@ -163,6 +163,7 @@ class MainActivity : AppCompatActivity() {
             statusView.text = buildString {
                 append("Shizuku Provider：${if (provider != null) "已注册" else "缺失"}\n")
                 append("Shizuku：${ShizukuBridge.status()}\n")
+                append("无障碍：${if (SpeakerAccessibilityService.isConnected()) "已连接" else "未连接"}\n")
                 if (ShizukuBridge.lastError.isNotBlank()) append("Shizuku 信息：${ShizukuBridge.lastError}\n")
                 append("当前后端：${CallState.lastBackend.ifBlank { "尚未执行" }}")
                 if (CallState.lastError.isNotBlank()) append("\n最后错误：${CallState.lastError}")
