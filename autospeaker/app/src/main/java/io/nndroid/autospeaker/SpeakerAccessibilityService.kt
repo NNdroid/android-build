@@ -13,8 +13,6 @@ import java.util.ArrayDeque
 import kotlin.math.abs
 
 class SpeakerAccessibilityService : AccessibilityService() {
-    private val labels = listOf("免提", "扬声器", "Speaker", "Speakerphone", "Handsfree", "Hands-free")
-    private val hints = listOf("speaker", "speakerphone", "handsfree", "hands_free", "audio_route", "免提", "扬声器")
     @Volatile private var clickInFlight = false
 
     override fun onServiceConnected() {
@@ -30,7 +28,8 @@ class SpeakerAccessibilityService : AccessibilityService() {
             captureLearningClick(event)
         }
 
-        if (!CallState.activeIncomingCall || !CallState.accessibilityFallbackRequested) return
+        val snapshot = CallState.current
+        if (!snapshot.active || !snapshot.accessibilityFallbackRequested) return
         AppLog.i(this, "Accessibility", "event type=${event.eventType} package=${event.packageName}")
         tryClickSpeaker("event:${event.eventType}")
     }
@@ -62,7 +61,8 @@ class SpeakerAccessibilityService : AccessibilityService() {
     }
 
     private fun tryClickSpeaker(trigger: String) {
-        if (!CallState.activeIncomingCall || !CallState.accessibilityFallbackRequested || clickInFlight) return
+        val snapshot = CallState.current
+        if (!snapshot.active || !snapshot.accessibilityFallbackRequested || clickInFlight) return
         val root = rootInActiveWindow ?: run {
             AppLog.w(this, "Accessibility", "root window unavailable trigger=$trigger")
             return
@@ -81,9 +81,7 @@ class SpeakerAccessibilityService : AccessibilityService() {
         val (target, matchedBy) = candidate
         if (target.isChecked || target.isSelected) {
             if (SpeakerController.isSpeakerActuallyActive(this, source = "Accessibility-selected")) {
-                CallState.accessibilityFallbackRequested = false
-                CallState.lastBackend = "无障碍（已开启）"
-                CallState.lastError = ""
+                CallState.markAccessibilitySucceeded("无障碍（已开启）")
                 AppLog.i(this, "Accessibility", "speaker already active package=$pkg matchedBy=$matchedBy")
             }
             return
@@ -108,14 +106,12 @@ class SpeakerAccessibilityService : AccessibilityService() {
 
         AppLog.i(this, "Accessibility", "clicked speaker candidate package=$pkg matchedBy=$matchedBy")
         handler.postDelayed({
-            if (!CallState.activeIncomingCall) {
+            if (!CallState.current.active) {
                 clickInFlight = false
                 return@postDelayed
             }
             if (SpeakerController.isSpeakerActuallyActive(this, source = "Accessibility")) {
-                CallState.accessibilityFallbackRequested = false
-                CallState.lastBackend = "无障碍"
-                CallState.lastError = ""
+                CallState.markAccessibilitySucceeded("无障碍")
                 AppLog.i(this, "Accessibility", "speaker route verified package=$pkg matchedBy=$matchedBy")
             } else {
                 CallState.lastError = "无障碍点击后实际路由仍不是扬声器"
@@ -173,7 +169,7 @@ class SpeakerAccessibilityService : AccessibilityService() {
     }
 
     private fun findSpeakerCandidate(root: AccessibilityNodeInfo): Pair<AccessibilityNodeInfo, String>? {
-        for (label in labels) {
+        for (label in SpeakerControlMatchers.labels) {
             val direct = root.findAccessibilityNodeInfosByText(label).firstOrNull {
                 it.isVisibleToUser && (it.isClickable || clickableParent(it) != null)
             }
@@ -190,11 +186,7 @@ class SpeakerAccessibilityService : AccessibilityService() {
                 val text = node.text?.toString().orEmpty()
                 val desc = node.contentDescription?.toString().orEmpty()
                 val viewId = node.viewIdResourceName.orEmpty()
-                val hint = hints.firstOrNull {
-                    text.contains(it, ignoreCase = true) ||
-                        desc.contains(it, ignoreCase = true) ||
-                        viewId.contains(it, ignoreCase = true)
-                }
+                val hint = SpeakerControlMatchers.matchHint(text, desc, viewId)
                 if (hint != null && (node.isClickable || clickableParent(node) != null)) {
                     val source = when {
                         viewId.contains(hint, ignoreCase = true) -> "viewId:$hint"
@@ -319,11 +311,13 @@ class SpeakerAccessibilityService : AccessibilityService() {
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .remove("fp_pkg").remove("fp_view_id").remove("fp_desc").remove("fp_class")
                 .remove("fp_cx").remove("fp_cy").remove("fp_w").remove("fp_h")
+                .remove("fp_auto")
                 .remove(KEY_UNTIL).apply()
             AppLog.i(context, "Learning", "learned speaker fingerprint cleared")
         }
 
-        private fun saveFingerprint(context: Context, fp: Fingerprint) {
+        /** Public so the Shizuku UI backend can auto-learn the speaker control from a dump. */
+        fun saveFingerprint(context: Context, fp: Fingerprint, auto: Boolean = false) {
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
                 .putString("fp_pkg", fp.pkg)
                 .putString("fp_view_id", fp.viewId)
@@ -333,10 +327,16 @@ class SpeakerAccessibilityService : AccessibilityService() {
                 .putInt("fp_cy", fp.cy)
                 .putInt("fp_w", fp.w)
                 .putInt("fp_h", fp.h)
+                .putBoolean("fp_auto", auto)
                 .apply()
         }
 
-        private fun loadFingerprint(context: Context): Fingerprint? {
+        /** True when the stored fingerprint was saved by the Shizuku dump path, not manually. */
+        fun isAutoFingerprint(context: Context): Boolean =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("fp_auto", false)
+
+        /** Public so the Shizuku UI backend can reuse the learned control fingerprint. */
+        fun loadFingerprint(context: Context): Fingerprint? {
             val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             if (!p.contains("fp_cx") || !p.contains("fp_cy")) return null
             return Fingerprint(

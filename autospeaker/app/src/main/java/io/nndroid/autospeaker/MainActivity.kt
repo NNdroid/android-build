@@ -23,6 +23,7 @@ import rikka.shizuku.Shizuku
 class MainActivity : AppCompatActivity() {
     private lateinit var tm: TelephonyManager
     private lateinit var statusView: TextView
+    private lateinit var modeButton: Button
     private lateinit var logView: TextView
     private val handler = Handler(Looper.getMainLooper())
 
@@ -62,7 +63,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(layout)
 
         layout.addView(TextView(this).apply {
-            text = "AutoSpeaker · vivo X60\n\n来电手动接听后自动尝试：\n1. AudioManager / setCommunicationDevice\n2. 无障碍点击系统电话界面的免提\n3. +1 秒稳定化重试\n4. Shizuku / Root 兜底\n\n如果系统电话只显示图标，可使用“学习免提按钮”：你手动点一次真正的扬声器图标，应用会在确认实际路由变成扬声器后保存该控件指纹。"
+            text = "AutoSpeaker · 事件驱动自动免提\n\n来电接听后监听 MODE_IN_CALL 与通信设备变化，在 5 秒窗口内最多重试，被 Telecom 重置后自动补回。\n\n路由模式：\n• Shizuku 主路径（默认，全程不需要无障碍）：AudioManager → Mode 接管（Android 12+，成功则 1 秒接通）→ Shizuku 在通话界面点免提（首次成功后自动记住按钮）→ Shizuku / Root 音频兜底\n• 无障碍主路径：AudioManager → 无障碍点击免提 → Mode 接管 / Shizuku UI / 音频、Root 兜底\n\n首次通话可能需要等待界面转储（5-10 秒）；“学习免提按钮”仅当免提是纯图标、自动匹配失败时才需要（学习时临时开启无障碍）。"
             textSize = 17f
         })
 
@@ -101,8 +102,28 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
+        modeButton = Button(this).apply {
+            setOnClickListener {
+                val newMode = if (SettingsStore.routeMode(this@MainActivity) == SettingsStore.MODE_SHIZUKU) {
+                    SettingsStore.MODE_ACCESSIBILITY
+                } else {
+                    SettingsStore.MODE_SHIZUKU
+                }
+                SettingsStore.setRouteMode(this@MainActivity, newMode)
+                AppLog.i(this@MainActivity, "UI", "route mode switched to $newMode")
+                Toast.makeText(
+                    this@MainActivity,
+                    if (newMode == SettingsStore.MODE_SHIZUKU) "路由模式：Shizuku 主路径（无障碍不再参与自动路由）"
+                    else "路由模式：无障碍主路径（Shizuku 作为兜底）",
+                    Toast.LENGTH_SHORT
+                ).show()
+                refreshStatus()
+            }
+        }
+        layout.addView(modeButton)
+
         layout.addView(Button(this).apply {
-            text = "开启 AutoSpeaker 无障碍（必须）"
+            text = "开启无障碍（学习免提按钮时需要）"
             setOnClickListener {
                 AppLog.i(this@MainActivity, "UI", "opening accessibility settings configured=${SpeakerAccessibilityService.isEnabledInSettings(this@MainActivity)} connected=${SpeakerAccessibilityService.isConnected()}")
                 Toast.makeText(this@MainActivity, "请在无障碍列表中找到 AutoSpeaker 并打开开关，然后返回本应用确认显示“已连接”", Toast.LENGTH_LONG).show()
@@ -125,7 +146,7 @@ class MainActivity : AppCompatActivity() {
                 AppLog.i(this@MainActivity, "UI", "speaker button learning requested")
                 Toast.makeText(
                     this@MainActivity,
-                    "学习模式已开启 30 秒。切回正在通话的 vivo 电话界面，手动点一次真正的扬声器图标；只有检测到实际切到扬声器才会保存。",
+                    "学习模式已开启 30 秒。切回正在通话的 vivo 电话界面，手动点一次真正的扬声器图标；只有检测到实际切到扬声器才会保存。学习到的指纹同时供无障碍与 Shizuku UI 后端使用。",
                     Toast.LENGTH_LONG
                 ).show()
                 refreshStatus()
@@ -200,6 +221,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshStatus() {
+        if (::modeButton.isInitialized) {
+            modeButton.text = when (SettingsStore.routeMode(this)) {
+                SettingsStore.MODE_ACCESSIBILITY -> "路由模式：无障碍主路径（点击切换）"
+                else -> "路由模式：Shizuku 主路径（点击切换）"
+            }
+        }
         if (::statusView.isInitialized) {
             val provider = packageManager.resolveContentProvider("$packageName.shizuku", 0)
             val accessibilityConfigured = SpeakerAccessibilityService.isEnabledInSettings(this)
@@ -207,9 +234,10 @@ class MainActivity : AppCompatActivity() {
             val learning = SpeakerAccessibilityService.isLearning(this)
             val learned = SpeakerAccessibilityService.hasLearnedFingerprint(this)
             statusView.text = buildString {
+                append("路由模式：${if (SettingsStore.routeMode(this@MainActivity) == SettingsStore.MODE_SHIZUKU) "Shizuku 主路径" else "无障碍主路径"}\n")
                 append("Shizuku Provider：${if (provider != null) "已注册" else "缺失"}\n")
                 append("Shizuku：${ShizukuBridge.status()}\n")
-                append("无障碍设置：${if (accessibilityConfigured) "已开启" else "未开启（必须开启）"}\n")
+                append("无障碍设置：${if (accessibilityConfigured) "已开启" else "未开启"}\n")
                 append("无障碍服务：${if (accessibilityConnected) "已连接" else "未连接"}\n")
                 append("免提按钮学习：${when { learning -> "学习中（请手动点一次扬声器图标）"; learned -> "已学习"; else -> "未学习" }}\n")
                 if (accessibilityConfigured && !accessibilityConnected) {

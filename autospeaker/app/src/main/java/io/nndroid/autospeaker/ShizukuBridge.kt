@@ -8,9 +8,17 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import rikka.shizuku.Shizuku
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 object ShizukuBridge {
     private const val REQUEST_CODE = 2046
+    private const val CALL_TIMEOUT_MS = 3000L
+    private const val DUMP_TIMEOUT_MS = 15_000L
+    private const val TAP_TIMEOUT_MS = 6000L
+    private const val WINDOW_TIMEOUT_MS = 4000L
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile private var service: IPrivilegedAudioService? = null
@@ -20,15 +28,17 @@ object ShizukuBridge {
     @Volatile var lastError: String = ""
         private set
 
-    private var pendingEnabled: Boolean? = null
-    private var pendingCallback: ((Boolean, String) -> Unit)? = null
+    @Volatile private var pendingOnReady: ((IPrivilegedAudioService) -> Unit)? = null
+    @Volatile private var pendingOnError: ((String) -> Unit)? = null
 
     private fun args(context: Context) = Shizuku.UserServiceArgs(
         ComponentName(context.packageName, ShizukuAudioService::class.java.name)
     ).processNameSuffix("autospeaker")
         .daemon(true)
-        .tag("autospeaker_audio_v4")
-        .version(4)
+        .tag("autospeaker_audio")
+        // The daemon survives APK updates; tie the version to versionCode so Shizuku
+        // restarts it with the new code after every app upgrade.
+        .version(BuildConfig.VERSION_CODE)
 
     private val binderReceivedListener = Shizuku.OnBinderReceivedListener {
         val context = appContext ?: return@OnBinderReceivedListener
@@ -46,19 +56,24 @@ object ShizukuBridge {
         service = null
         binding = false
         lastError = "Shizuku Binder disconnected"
+        val errCb = pendingOnError
+        pendingOnReady = null
+        pendingOnError = null
+        errCb?.invoke(lastError)
         if (context != null) AppLog.w(context, "Shizuku", "binder died; waiting for Shizuku server to return")
     }
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             binding = false
-            service = IPrivilegedAudioService.Stub.asInterface(binder)
+            val iface = binder?.let { IPrivilegedAudioService.Stub.asInterface(it) }
+            service = iface
             appContext?.let { AppLog.i(it, "Shizuku", "UserService connected component=$name") }
-            val enabled = pendingEnabled
-            val callback = pendingCallback
-            pendingEnabled = null
-            pendingCallback = null
-            if (enabled != null && callback != null) execute(enabled, callback)
+            val onReady = pendingOnReady
+            val onError = pendingOnError
+            pendingOnReady = null
+            pendingOnError = null
+            if (iface != null) onReady?.invoke(iface) else onError?.invoke("UserService connected without binder")
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -125,57 +140,130 @@ object ShizukuBridge {
         else -> "已授权"
     }
 
+    fun isReady(): Boolean = runCatching {
+        Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+    }.getOrDefault(false)
+
     fun warmUp(context: Context) {
         init(context)
         if (!runCatching { Shizuku.pingBinder() }.getOrDefault(false)) {
             AppLog.w(context, "Shizuku", "warmUp skipped: binder unavailable")
             return
         }
-        if (runCatching { Shizuku.checkSelfPermission() }.getOrDefault(PackageManager.PERMISSION_DENIED) != PackageManager.PERMISSION_GRANTED) {
-            AppLog.i(context, "Shizuku", "warmUp skipped: permission not granted")
-            return
-        }
         if (service != null || binding) return
 
-        binding = true
-        AppLog.i(context, "Shizuku", "binding daemon UserService uid=${runCatching { Shizuku.getUid() }.getOrDefault(-1)}")
-        mainHandler.post {
-            runCatching { Shizuku.bindUserService(args(context.applicationContext), connection) }
-                .onFailure {
-                    binding = false
-                    lastError = "Bind failed: ${it.javaClass.simpleName}: ${it.message}"
-                    AppLog.e(context, "Shizuku", "UserService bind failed", it)
-                }
-        }
+        AppLog.i(context, "Shizuku", "warming daemon UserService uid=${runCatching { Shizuku.getUid() }.getOrDefault(-1)}")
+        ensureService(context,
+            onReady = { appContext?.let { AppLog.i(it, "Shizuku", "UserService warmed up") } },
+            onError = { appContext?.let { AppLog.w(it, "Shizuku", "warm up failed: $it") } }
+        )
     }
 
+    // ------------------------------------------------------------------
+    // Privileged calls (all bounded by a timeout so a hung daemon cannot
+    // stall the fallback chain)
+    // ------------------------------------------------------------------
+
     fun setSpeaker(context: Context, enabled: Boolean, callback: (Boolean, String) -> Unit) {
-        init(context)
         lastError = ""
         AppLog.i(context, "Shizuku", "setSpeaker enabled=$enabled status=${status()}")
+        ensureService(context,
+            onReady = { _ ->
+                invokeOnService(CALL_TIMEOUT_MS, { svc ->
+                    val ok = runCatching { svc.setSpeakerphone(enabled) }.getOrDefault(false)
+                    val detail = if (ok) "" else runCatching { svc.lastError }.getOrDefault("Shizuku route failed")
+                    ok to detail
+                }) { result ->
+                    val (ok, detail) = result.getOrElse { false to (it.message ?: "Shizuku route failed") }
+                    if (!ok) lastError = detail
+                    appContext?.let {
+                        if (ok) AppLog.i(it, "Shizuku", "speaker route succeeded")
+                        else AppLog.w(it, "Shizuku", "speaker route failed: $detail")
+                    }
+                    callback(ok, detail)
+                }
+            },
+            onError = { callback(false, it) }
+        )
+    }
 
-        val ready = runCatching {
-            Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-        }.getOrDefault(false)
+    /** Returns "OK:<xml>" on success, "ERR:<reason>" or null on failure. */
+    fun dumpUi(context: Context, callback: (String?) -> Unit) {
+        ensureService(context,
+            onReady = { _ ->
+                invokeOnService(DUMP_TIMEOUT_MS, { svc -> svc.dumpUi() }) { result ->
+                    val value = result.getOrNull()
+                    if (value == null) {
+                        AppLog.w(context, "Shizuku", "dumpUi failed: ${result.exceptionOrNull()?.message}")
+                    }
+                    callback(value)
+                }
+            },
+            onError = {
+                AppLog.w(context, "Shizuku", "dumpUi unavailable: $it")
+                callback("ERR:$it")
+            }
+        )
+    }
 
-        if (!ready) {
-            lastError = if (runCatching { Shizuku.pingBinder() }.getOrDefault(false)) {
+    fun inputTap(context: Context, x: Int, y: Int, callback: (Boolean) -> Unit) {
+        ensureService(context,
+            onReady = { _ ->
+                invokeOnService(TAP_TIMEOUT_MS, { svc ->
+                    runCatching { svc.inputTap(x, y) }.getOrDefault(false)
+                }) { result ->
+                    callback(result.getOrElse { false })
+                }
+            },
+            onError = {
+                AppLog.w(context, "Shizuku", "inputTap unavailable: $it")
+                callback(false)
+            }
+        )
+    }
+
+    /** Focused window package via dumpsys; "" on any failure. */
+    fun currentWindowPackage(context: Context, callback: (String) -> Unit) {
+        ensureService(context,
+            onReady = { _ ->
+                invokeOnService(WINDOW_TIMEOUT_MS, { svc ->
+                    runCatching { svc.currentWindowPackage() }.getOrDefault("")
+                }) { result ->
+                    callback(result.getOrElse { "" })
+                }
+            },
+            onError = {
+                AppLog.w(context, "Shizuku", "currentWindowPackage unavailable: $it")
+                callback("")
+            }
+        )
+    }
+
+    private fun ensureService(
+        context: Context,
+        onReady: (IPrivilegedAudioService) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        init(context)
+        if (!isReady()) {
+            val err = if (runCatching { Shizuku.pingBinder() }.getOrDefault(false)) {
                 "Shizuku permission not granted"
             } else {
                 "Shizuku Binder unavailable"
             }
-            AppLog.w(context, "Shizuku", lastError)
-            callback(false, lastError)
+            lastError = err
+            AppLog.w(context, "Shizuku", err)
+            onError(err)
             return
         }
 
         service?.let {
-            execute(enabled, callback)
+            onReady(it)
             return
         }
 
-        pendingEnabled = enabled
-        pendingCallback = callback
+        pendingOnReady = onReady
+        pendingOnError = onError
         if (binding) return
         binding = true
 
@@ -185,31 +273,44 @@ object ShizukuBridge {
                     binding = false
                     lastError = "Bind failed: ${it.javaClass.simpleName}: ${it.message}"
                     AppLog.e(context, "Shizuku", "bind failed", it)
-                    val cb = pendingCallback
-                    pendingEnabled = null
-                    pendingCallback = null
-                    cb?.invoke(false, lastError)
+                    val errCb = pendingOnError
+                    pendingOnReady = null
+                    pendingOnError = null
+                    errCb?.invoke(lastError)
                 }
         }
     }
 
-    private fun execute(enabled: Boolean, callback: (Boolean, String) -> Unit) {
+    private fun <T> invokeOnService(
+        timeoutMs: Long,
+        call: (IPrivilegedAudioService) -> T,
+        onDone: (Result<T>) -> Unit
+    ) {
         Thread {
             val current = service
             if (current == null) {
-                val error = "Shizuku user service unavailable"
-                appContext?.let { AppLog.w(it, "Shizuku", error) }
-                mainHandler.post { callback(false, error) }
+                onDone(Result.failure(IllegalStateException("Shizuku user service unavailable")))
                 return@Thread
             }
-            val ok = runCatching { current.setSpeakerphone(enabled) }.getOrDefault(false)
-            val error = if (ok) "" else runCatching { current.lastError }.getOrDefault("Shizuku route failed")
-            if (!ok) lastError = error
-            appContext?.let {
-                if (ok) AppLog.i(it, "Shizuku", "speaker route succeeded")
-                else AppLog.w(it, "Shizuku", "speaker route failed: $error")
+            val executor = Executors.newSingleThreadExecutor()
+            val result = try {
+                val future = executor.submit(Callable { call(current) })
+                try {
+                    Result.success(future.get(timeoutMs, TimeUnit.MILLISECONDS))
+                } catch (e: TimeoutException) {
+                    future.cancel(true)
+                    // Treat the daemon as stale so the next call rebinds instead of
+                    // talking to a possibly hung service forever.
+                    service = null
+                    binding = false
+                    Result.failure(TimeoutException("Shizuku call timed out after ${timeoutMs}ms"))
+                }
+            } catch (e: Exception) {
+                Result.failure(e)
+            } finally {
+                executor.shutdownNow()
             }
-            mainHandler.post { callback(ok, error) }
+            mainHandler.post { onDone(result) }
         }.start()
     }
 }

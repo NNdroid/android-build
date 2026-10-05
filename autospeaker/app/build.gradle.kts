@@ -11,8 +11,8 @@ android {
         applicationId = "io.nndroid.autospeaker"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.3.4"
+        versionCode = 11
+        versionName = "0.4.4"
     }
 
     compileOptions {
