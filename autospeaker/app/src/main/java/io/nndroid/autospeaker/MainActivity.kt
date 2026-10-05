@@ -63,7 +63,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(layout)
 
         layout.addView(TextView(this).apply {
-            text = "AutoSpeaker · 事件驱动自动免提\n\n来电接听后监听 MODE_IN_CALL 与通信设备变化，在 5 秒窗口内最多重试，被 Telecom 重置后自动补回。\n\n路由模式：\n• Shizuku 主路径（默认，全程不需要无障碍）：AudioManager → Mode 接管（Android 12+，成功则 1 秒接通）→ Shizuku 在通话界面点免提（首次成功后自动记住按钮）→ Shizuku / Root 音频兜底\n• 无障碍主路径：AudioManager → 无障碍点击免提 → Mode 接管 / Shizuku UI / 音频、Root 兜底\n\n首次通话可能需要等待界面转储（5-10 秒）；“学习免提按钮”仅当免提是纯图标、自动匹配失败时才需要（学习时临时开启无障碍）。"
+            text = "AutoSpeaker · 事件驱动自动免提\n\n来电接听后监听 MODE_IN_CALL 与通信设备变化，在 5 秒窗口内最多重试，被 Telecom 重置后自动补回。\n\n路由模式：\n• Shizuku 主路径（默认，全程不需要无障碍）：AudioManager → Mode 接管（部分 ROM 支持）→ Shizuku 在通话界面点免提 → Shizuku / Root 音频兜底\n• 无障碍主路径：AudioManager → 无障碍点击免提 → Mode 接管 / Shizuku UI / 音频、Root 兜底\n\n首次通话（还没有学习指纹）时：像平时一样手动点一次免提按钮即可，应用会从触摸事件自动学习它的位置（无需无障碍）；之后每次通话自动秒切。“学习免提按钮”为备用手段。"
             textSize = 17f
         })
 

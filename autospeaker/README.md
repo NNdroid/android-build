@@ -15,7 +15,7 @@ Instead of racing Telecom with fixed delays, AutoSpeaker listens for `AudioManag
 - **Shizuku-first (default)** — routing does not require the accessibility service:
   1. `AudioManager` / `setCommunicationDevice`
   2. Mode-owner backend (Android 12+): briefly takes `MODE_IN_COMMUNICATION`, which makes the app's own communication-device request authoritative instead of the mode owner's, then re-requests the speaker and verifies. Restored at call end. Note: while the app owns the audio mode, manual route toggles inside the dialer may not take effect until hangup.
-  3. Shizuku UI backend: on the first call it finds the speaker control via `uiautomator dump` (keyword match), taps it, and **auto-learns** the control so later calls take the sub-second `dumpsys`-verified fast path — the accessibility service is never involved
+  3. Shizuku UI backend (first call, no fingerprint yet): watches the user's own manual speaker tap via raw touch events (`getevent`) and learns the button coordinates from it, and/or finds the control via `uiautomator dump` keyword match; either way the control is **auto-learned** so later calls take the sub-second `dumpsys`-verified fast path — the accessibility service is never involved
   4. Shizuku audio route (shell-identity `IAudioService` / `AudioSystem.setForceUse`, verified against the real route)
   5. Root audio route (`su` + `app_process`, process held alive for 10 s so the per-client request survives binder death, cleaned up with an explicit off after the call)
 - **Accessibility-first** — the proven vivo path:
@@ -23,7 +23,7 @@ Instead of racing Telecom with fixed delays, AutoSpeaker listens for `AudioManag
   2. Accessibility clicks the visible `免提` / `扬声器` / `Speaker` control
   3. Mode-owner, Shizuku UI / audio, then Root as fallback
 
-The speaker-button fingerprint is shared by both modes. The Shizuku backend auto-learns it after the first successful tap; manual learning ("学习免提按钮", which temporarily enables the accessibility service) is only needed when the in-call speaker button has no text, description or view id at all.
+The speaker-button fingerprint is shared by both modes. The Shizuku backend auto-learns it from the user's own manual tap or from a verified window-dump tap; manual learning ("学习免提按钮", which temporarily enables the accessibility service) is a legacy fallback.
 
 ## Background reliability
 

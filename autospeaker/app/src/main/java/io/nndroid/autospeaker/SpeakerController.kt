@@ -23,6 +23,8 @@ object SpeakerController {
     private const val MAX_AUDIO_ATTEMPTS = 3
     private const val ACCESSIBILITY_HANDOFF_WAIT_MS = 2200L
     private const val UI_TAP_VERIFY_DELAY_MS = 700L
+    // How long to wait for the user's manual speaker tap before moving on to audio backends.
+    private const val LEARN_WINDOW_MS = 12_000L
 
     private enum class Phase { IDLE, WATCHING, HANDOFF, DONE }
 
@@ -44,6 +46,7 @@ object SpeakerController {
     @Volatile private var rootAudioUsed = false
     @Volatile private var resetObserved = false
     @Volatile private var modeOwnerUsed = false
+    @Volatile private var touchCaptureStarted = false
 
     // Cached uiautomator dump for the current call (main-thread confined). Pre-warmed at
     // handoff start so the slow dump overlaps the rest of the chain. Token guards against a
@@ -130,6 +133,9 @@ object SpeakerController {
                 AppLog.w(ctx, TAG, "communication device event: route moved away from speaker device=${describeDevice(device)}")
                 routeEstablished = false
                 resetObserved = true
+                // The app-process path has provably lost; start the slow window dump now so
+                // it overlaps the rest of the chain instead of starting at handoff.
+                if (ShizukuBridge.isReady()) prewarmUiDump(ctx)
                 val attemptCap = if (resetObserved) 2 else MAX_AUDIO_ATTEMPTS
                 if (audioAttempts < attemptCap && !retryPosted) {
                     retryPosted = true
@@ -193,6 +199,7 @@ object SpeakerController {
         phase = Phase.DONE
         mainHandler.removeCallbacksAndMessages(null)
         unregisterRouteListeners()
+        stopTouchCaptureIfNeeded()
         if (wasActive) AppLog.i(context, TAG, "route chain stopped: call ended")
 
         RootBackend.destroyHoldProcess()
@@ -310,23 +317,25 @@ object SpeakerController {
     private fun runModeOwnerBackend(ctx: Context, next: () -> Unit): Boolean {
         val a = audio ?: return false
         modeOwnerUsed = true
-        val modeBefore = runCatching { a.mode }.getOrDefault(-1)
-        AppLog.i(ctx, TAG, "mode-owner backend: taking MODE_IN_COMMUNICATION so our communication-device request becomes authoritative (mode before=$modeBefore)")
-        val changed = runCatching { a.mode = AudioManager.MODE_IN_COMMUNICATION }
-            .onFailure { AppLog.e(ctx, TAG, "setMode(MODE_IN_COMMUNICATION) failed", it) }
-            .isSuccess
+        runCatching { a.mode = AudioManager.MODE_IN_COMMUNICATION }
         val modeAfter = runCatching { a.mode }.getOrDefault(-1)
-        AppLog.i(ctx, TAG, "mode-owner backend: mode after setMode=$modeAfter (${if (modeAfter == AudioManager.MODE_IN_COMMUNICATION) "takeover applied" else "takeover rejected/reverted"})")
-        if (changed) {
-            requestPublicSpeakerRoute(ctx, a, "mode-owner")
+        if (modeAfter != AudioManager.MODE_IN_COMMUNICATION) {
+            // Some ROMs (MIUI observed) silently reject third-party mode changes while a GSM
+            // call holds MODE_IN_CALL — bail out immediately instead of burning a verify cycle.
+            CallState.lastError = "Mode 接管被 ROM 拒绝 (mode=$modeAfter)"
+            AppLog.w(ctx, TAG, "mode takeover rejected by the ROM (mode after=$modeAfter); skipping mode-owner backend")
+            next()
+            return true
         }
+        AppLog.i(ctx, TAG, "mode-owner backend: MODE_IN_COMMUNICATION taken; requesting speaker")
+        requestPublicSpeakerRoute(ctx, a, "mode-owner")
         mainHandler.postDelayed({
             if (phase != Phase.HANDOFF || !CallState.current.active) return@postDelayed
-            if (changed && isSpeakerActuallyActive(ctx, source = "ModeOwner")) {
+            if (isSpeakerActuallyActive(ctx, source = "ModeOwner")) {
                 markSuccess("Mode 接管")
                 finishChain("mode-owner backend succeeded")
             } else {
-                CallState.lastError = "Mode 接管后路由仍不是扬声器 (mode=$modeAfter)"
+                CallState.lastError = "Mode 接管后路由仍不是扬声器"
                 AppLog.w(ctx, TAG, "mode-owner backend did not establish speaker; continuing fallback chain")
                 next()
             }
@@ -361,17 +370,104 @@ object SpeakerController {
             AppLog.w(ctx, TAG, "Shizuku not ready; skipping UI backend")
             return false
         }
-        tryShizukuUiClick(ctx) { ok, error ->
-            if (phase != Phase.HANDOFF || !CallState.current.active) return@tryShizukuUiClick
+        val learned = SpeakerAccessibilityService.loadFingerprint(ctx)
+        if (learned != null) {
+            tryShizukuUiClick(ctx) { ok, error ->
+                if (phase != Phase.HANDOFF || !CallState.current.active) return@tryShizukuUiClick
+                if (ok) {
+                    markSuccess("Shizuku UI 点击")
+                    finishChain("shizuku ui backend succeeded")
+                } else {
+                    CallState.lastError = "Shizuku UI: $error"
+                    next()
+                }
+            }
+            return true
+        }
+
+        // No fingerprint yet: try the window dump and, in parallel, learn from the user's own
+        // manual speaker tap (read from /dev/input by the daemon — no accessibility involved).
+        AppLog.i(ctx, TAG, "Shizuku UI backend: no learned fingerprint; arming tap learning plus window dump")
+        ShizukuBridge.startTouchCapture(ctx) { started ->
+            if (started) {
+                touchCaptureStarted = true
+                AppLog.i(ctx, TAG, "touch capture armed: tap the speaker button manually once and the app will learn it")
+                startTapPolling(ctx)
+            } else {
+                AppLog.w(ctx, TAG, "touch capture unavailable; relying on the window dump only")
+            }
+        }
+        dumpAndTap(ctx, null) { ok, error ->
+            if (phase != Phase.HANDOFF || !CallState.current.active) return@dumpAndTap
             if (ok) {
                 markSuccess("Shizuku UI 点击")
                 finishChain("shizuku ui backend succeeded")
-            } else {
-                CallState.lastError = "Shizuku UI: $error"
-                next()
+                return@dumpAndTap
             }
+            CallState.lastError = "Shizuku UI: $error"
+            // Give the manual-tap learner a window before moving on to the audio backends.
+            mainHandler.postDelayed({
+                if (phase != Phase.HANDOFF || !CallState.current.active) return@postDelayed
+                AppLog.w(ctx, TAG, "no tap learned within ${LEARN_WINDOW_MS}ms; continuing fallback chain")
+                next()
+            }, LEARN_WINDOW_MS)
         }
         return true
+    }
+
+    private fun startTapPolling(ctx: Context) {
+        var lastSeen = 0
+        val poll = object : Runnable {
+            override fun run() {
+                if (phase != Phase.HANDOFF || !CallState.current.active) return
+                ShizukuBridge.pollTouchCapture(ctx) { result ->
+                    if (phase != Phase.HANDOFF || !CallState.current.active) return@pollTouchCapture
+                    val parts = result.split(":")
+                    val count = parts.getOrNull(0)?.toIntOrNull() ?: 0
+                    val coords = parts.getOrNull(1)?.split(",")?.mapNotNull { it.toIntOrNull() }
+                    if (count > lastSeen && coords != null && coords.size == 2 && coords[0] >= 0 && coords[1] >= 0) {
+                        lastSeen = count
+                        val (x, y) = coords
+                        AppLog.i(ctx, TAG, "manual tap captured at $x,$y; verifying whether it enabled the speaker")
+                        mainHandler.postDelayed({
+                            if (phase != Phase.HANDOFF || !CallState.current.active) return@postDelayed
+                            if (isSpeakerActuallyActive(ctx, source = "TapLearn")) {
+                                saveTapFingerprint(ctx, x, y)
+                                markSuccess("手动点击（已学习）")
+                                finishChain("manual speaker tap verified and learned")
+                            }
+                        }, UI_TAP_VERIFY_DELAY_MS)
+                    }
+                    mainHandler.postDelayed(this, 900)
+                }
+            }
+        }
+        mainHandler.postDelayed(poll, 1200)
+    }
+
+    private fun saveTapFingerprint(ctx: Context, x: Int, y: Int) {
+        val existing = SpeakerAccessibilityService.loadFingerprint(ctx)
+        if (existing != null && !SpeakerAccessibilityService.isAutoFingerprint(ctx)) return
+        val dm = ctx.resources.displayMetrics
+        fun norm(value: Int, max: Int) = if (max <= 0) 0 else ((value.toLong() * 10000L) / max).toInt()
+        val fp = SpeakerAccessibilityService.Fingerprint(
+            pkg = "",
+            viewId = "",
+            desc = "",
+            className = "",
+            cx = norm(x, dm.widthPixels),
+            cy = norm(y, dm.heightPixels),
+            w = 0,
+            h = 0
+        )
+        SpeakerAccessibilityService.saveFingerprint(ctx, fp, auto = true)
+        AppLog.i(ctx, TAG, "speaker control learned from manual tap at $x,$y; next calls use the fast path")
+    }
+
+    private fun stopTouchCaptureIfNeeded() {
+        if (!touchCaptureStarted) return
+        touchCaptureStarted = false
+        context()?.let { ShizukuBridge.stopTouchCapture(it) }
     }
 
     private fun runShizukuAudioBackend(ctx: Context, next: () -> Unit): Boolean {
@@ -675,6 +771,7 @@ object SpeakerController {
         mainHandler.removeCallbacks(ticker)
         mainHandler.removeCallbacks(modeWaitRunnable)
         unregisterRouteListeners()
+        stopTouchCaptureIfNeeded()
         context()?.let { AppLog.i(it, TAG, "route chain finished: $reason") }
     }
 

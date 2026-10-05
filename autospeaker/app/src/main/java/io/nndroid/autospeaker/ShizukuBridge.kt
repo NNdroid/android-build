@@ -239,6 +239,50 @@ object ShizukuBridge {
         )
     }
 
+    // Touch capture: learn the speaker button from the user's own manual tap, read from
+    // /dev/input by the daemon (root/shell privilege) — no accessibility involved.
+
+    fun startTouchCapture(context: Context, callback: (Boolean) -> Unit) {
+        ensureService(context,
+            onReady = { _ ->
+                invokeOnService(CALL_TIMEOUT_MS, { svc ->
+                    runCatching { svc.startTouchCapture() }.getOrDefault(false)
+                }) { result ->
+                    callback(result.getOrElse { false })
+                }
+            },
+            onError = {
+                AppLog.w(context, "Shizuku", "startTouchCapture unavailable: $it")
+                callback(false)
+            }
+        )
+    }
+
+    /** "<tapCount>:<screenX>,<screenY>"; "-1,-1" when no tap captured yet. */
+    fun pollTouchCapture(context: Context, callback: (String) -> Unit) {
+        ensureService(context,
+            onReady = { _ ->
+                invokeOnService(2000, { svc ->
+                    runCatching { svc.pollTouchCapture() }.getOrDefault("0:-1,-1")
+                }) { result ->
+                    callback(result.getOrElse { "0:-1,-1" })
+                }
+            },
+            onError = { callback("0:-1,-1") }
+        )
+    }
+
+    fun stopTouchCapture(context: Context) {
+        ensureService(context,
+            onReady = { _ ->
+                invokeOnService(CALL_TIMEOUT_MS, { svc ->
+                    runCatching { svc.stopTouchCapture() }.isSuccess
+                }) { }
+            },
+            onError = { }
+        )
+    }
+
     private fun ensureService(
         context: Context,
         onReady: (IPrivilegedAudioService) -> Unit,
